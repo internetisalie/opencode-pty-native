@@ -1073,12 +1073,9 @@ fn publish_foreground_process(
 fn foreground_process(master: &dyn MasterPty) -> Option<String> {
     let foreground_group = master.process_group_leader()?;
     let tty = master.tty_name();
-    let processes = std::fs::read_dir("/proc")
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
-        .filter_map(read_process)
-        .collect::<Vec<_>>();
+    let processes = group_processes(foreground_group)
+        .filter(|processes| processes.iter().any(|p| p.pgrp == foreground_group))
+        .unwrap_or_else(all_processes);
     let parents = processes
         .iter()
         .map(|process| (process.pid, process.ppid))
@@ -1106,6 +1103,52 @@ fn foreground_process(master: &dyn MasterPty) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 fn foreground_process(_master: &dyn MasterPty) -> Option<String> {
     None
+}
+
+/// Walks the descendants of the foreground group's leader through
+/// `/proc/<pid>/task/*/children`, which costs a read per process in the job
+/// instead of one per process on the host. Returns `None` when the leader is
+/// gone or the kernel does not expose `children`; the caller then scans `/proc`.
+#[cfg(target_os = "linux")]
+fn group_processes(leader: i32) -> Option<Vec<ProcessInfo>> {
+    let root = read_process(leader)?;
+    std::fs::metadata(format!("/proc/{leader}/task/{leader}/children")).ok()?;
+    let mut found = vec![root];
+    let mut pending = vec![leader];
+    let mut seen = HashSet::from([leader]);
+    while let Some(pid) = pending.pop() {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+            continue;
+        };
+        for task in tasks.filter_map(|entry| entry.ok()) {
+            let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+                continue;
+            };
+            for child in children
+                .split_whitespace()
+                .filter_map(|child| child.parse::<i32>().ok())
+            {
+                if seen.insert(child) {
+                    if let Some(process) = read_process(child) {
+                        found.push(process);
+                    }
+                    pending.push(child);
+                }
+            }
+        }
+    }
+    Some(found)
+}
+
+#[cfg(target_os = "linux")]
+fn all_processes() -> Vec<ProcessInfo> {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter_map(read_process)
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -1748,5 +1791,35 @@ mod tests {
             receive_actor_message(&messages, &mut pending).unwrap(),
             ActorMessage::Shutdown
         ));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn group_processes_finds_the_job_without_scanning_the_host() {
+        use std::os::unix::process::CommandExt;
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 5 & wait"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pgid = leader.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let names = loop {
+            let names = group_processes(pgid)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|process| process.pgrp == pgid)
+                .map(|process| process.name)
+                .collect::<Vec<_>>();
+            if names.iter().any(|name| name == "sleep") || Instant::now() > deadline {
+                break names;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let _ = leader.kill();
+        let _ = leader.wait();
+        assert!(names.iter().any(|name| name == "sh"), "{names:?}");
+        assert!(names.iter().any(|name| name == "sleep"), "{names:?}");
+        assert!(group_processes(i32::MAX).is_none());
     }
 }
